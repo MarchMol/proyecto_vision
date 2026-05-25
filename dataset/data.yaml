@@ -1,7 +1,9 @@
-path: C:\Users\JM\Documents\5to1sem\Vision\proyecto_vision\dataset
+# Ultralytics YOLO dataset config
+# path se sobreescribe dinámicamente en train.py para funcionar en cualquier máquina
+path: ./dataset
 train: images/train
 val: images/val
 nc: 2
 names:
-- bottles
-- tshirts
+  - bottles
+  - tshirts
