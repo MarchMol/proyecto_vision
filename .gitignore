@@ -1,3 +1,5 @@
 data_mining/data/
 __pycache__/
 test/
+venv
+dataset_aug
