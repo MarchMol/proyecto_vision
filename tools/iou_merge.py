@@ -1,16 +1,26 @@
 """
 tools/iou_merge.py
 ------------------
-Fusiona las anotaciones de múltiples anotadores y genera el ground truth
-del conjunto de prueba en formato YOLO.
+Lee test_images/labels_raw/, fusiona las anotaciones de múltiples anotadores
+con un promedio ponderado por consenso, y escribe el ground truth final en
+test_images/labels/ en formato YOLO estándar.
 
-Flujo:
-  1. Lee todos los JSONs de test_set/annotations/
-  2. Agrupa las cajas por imagen
-  3. Calcula IoU inter-anotador (acuerdo) para cada imagen
-  4. Genera la caja fusionada como promedio de todas las cajas
-  5. Exporta test_set/labels/<imagen>.txt en formato YOLO
-  6. Genera test_set/agreement_report.json con métricas de acuerdo
+Algoritmo (weighted-consensus merge):
+    Para cada imagen con N anotadores:
+      1. Calcular IoU par-a-par entre todas las cajas.
+      2. consensus_score[i] = mean(iou(i, j) para j ≠ i)
+         → cajas que coinciden con las demás pesan más.
+      3. Si todos los scores son 0 (desacuerdo total) → pesos uniformes 1/N.
+      4. Caja fusionada = promedio ponderado de (cx, cy, w, h).
+      5. Clase = mayoría de votos.
+    Toda imagen se exporta siempre; --min-iou solo determina el flag en el
+    reporte (no omite imágenes).
+
+Formato de entrada  (labels_raw/<stem>.txt):
+    <anotador> <class_id> <cx> <cy> <w> <h>   — una línea por anotador
+
+Formato de salida   (labels/<stem>.txt):
+    <class_id> <cx> <cy> <w> <h>              — YOLO estándar
 
 Uso:
     python tools/iou_merge.py
@@ -22,168 +32,167 @@ import json
 from itertools import combinations
 from pathlib import Path
 
-from PIL import Image
-
 PROJECT_ROOT = Path(__file__).parent.parent
-ANNOTATIONS_DIR = PROJECT_ROOT / "test_set" / "annotations"
-IMAGES_DIR = PROJECT_ROOT / "test_set" / "images"
-LABELS_DIR = PROJECT_ROOT / "test_set" / "labels"
+LABELS_RAW_DIR = PROJECT_ROOT / "test_images" / "labels_raw"
+LABELS_OUT_DIR = PROJECT_ROOT / "test_images" / "labels"
+REPORT_PATH    = PROJECT_ROOT / "test_images" / "agreement_report.json"
 
-CLASS_IDS = {"bottles": 0, "tshirts": 1}
+CLASS_NAMES = {0: "bottles", 1: "tshirts"}
 
 
-# ── geometry ──────────────────────────────────────────────────────────────────
+# ── geometry (normalized coords throughout) ───────────────────────────────────
 
-def iou(a: list, b: list) -> float:
-    ix1 = max(a[0], b[0])
-    iy1 = max(a[1], b[1])
-    ix2 = min(a[2], b[2])
-    iy2 = min(a[3], b[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+def yolo_to_xyxy(box: list[float]) -> list[float]:
+    cx, cy, w, h = box
+    return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+
+
+def iou(a: list[float], b: list[float]) -> float:
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
     area_a = (a[2] - a[0]) * (a[3] - a[1])
     area_b = (b[2] - b[0]) * (b[3] - b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
 
 
-def average_box(boxes: list[list]) -> list[int]:
-    return [int(sum(b[i] for b in boxes) / len(boxes)) for i in range(4)]
+def consensus_merge(entries: list[dict]) -> tuple[int, list[float], float | None, list[float]]:
+    """
+    entries: [{"name": str, "cls_id": int, "box": [cx,cy,w,h]}, ...]
+    Returns (cls_id, merged_box, mean_iou_or_None, weights).
+    """
+    n = len(entries)
+    xyxy = [yolo_to_xyxy(e["box"]) for e in entries]
+
+    if n == 1:
+        weights = [1.0]
+        mean_iou = None
+    else:
+        pair_ious = {
+            (i, j): iou(xyxy[i], xyxy[j])
+            for i, j in combinations(range(n), 2)
+        }
+        scores = []
+        for i in range(n):
+            neighbours = [pair_ious[tuple(sorted((i, j)))] for j in range(n) if j != i]
+            scores.append(sum(neighbours) / (n - 1))
+
+        total = sum(scores)
+        weights = [s / total for s in scores] if total > 0 else [1.0 / n] * n
+
+        all_pairs = list(pair_ious.values())
+        mean_iou = sum(all_pairs) / len(all_pairs)
+
+    merged = [
+        sum(w * e["box"][i] for w, e in zip(weights, entries))
+        for i in range(4)
+    ]
+
+    classes = [e["cls_id"] for e in entries]
+    cls_id = max(set(classes), key=classes.count)
+
+    return cls_id, merged, mean_iou, weights
 
 
-def box_to_yolo(box: list, img_w: int, img_h: int) -> tuple[float, float, float, float]:
-    x1, y1, x2, y2 = box
-    cx = ((x1 + x2) / 2) / img_w
-    cy = ((y1 + y2) / 2) / img_h
-    w = (x2 - x1) / img_w
-    h = (y2 - y1) / img_h
-    return cx, cy, w, h
+# ── I/O ───────────────────────────────────────────────────────────────────────
+
+def read_raw_labels(raw_dir: Path) -> dict[str, list[dict]]:
+    """Return {stem: [{"name", "cls_id", "box"}, ...]} for every txt file."""
+    by_image: dict[str, list[dict]] = {}
+    for txt in sorted(raw_dir.glob("*.txt")):
+        entries = []
+        for line in txt.read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if len(parts) != 6:
+                continue
+            name = parts[0]
+            cls_id = int(parts[1])
+            box = list(map(float, parts[2:]))
+            entries.append({"name": name, "cls_id": cls_id, "box": box})
+        if entries:
+            by_image[txt.stem] = entries
+    return by_image
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def run(min_iou: float = 0.3) -> None:
-    ann_files = sorted(ANNOTATIONS_DIR.glob("*.json"))
-    if not ann_files:
-        print(f"No se encontraron archivos JSON en {ANNOTATIONS_DIR}")
+    if not LABELS_RAW_DIR.exists():
+        print(f"No se encontró la carpeta {LABELS_RAW_DIR}")
         print("Corre primero tools/annotator.py para al menos un anotador.")
         return
 
-    # Index annotations by image name
-    by_image: dict[str, list[dict]] = {}
-    annotators: list[str] = []
+    by_image = read_raw_labels(LABELS_RAW_DIR)
+    if not by_image:
+        print(f"No se encontraron entradas en {LABELS_RAW_DIR}")
+        return
 
-    for ann_file in ann_files:
-        with open(ann_file, encoding="utf-8") as f:
-            data = json.load(f)
-        annotators.append(data["annotator"])
-        for ann in data["annotations"]:
-            if not ann.get("box"):
-                continue
-            by_image.setdefault(ann["image"], []).append(
-                {
-                    "annotator": data["annotator"],
-                    "class": ann.get("class", "bottles"),
-                    "box": ann["box"],
-                }
-            )
-
-    print(f"Anotadores encontrados : {', '.join(annotators)}")
+    all_annotators = sorted({e["name"] for entries in by_image.values() for e in entries})
+    print(f"Anotadores encontrados : {', '.join(all_annotators)}")
     print(f"Imágenes con ≥1 caja   : {len(by_image)}")
-    print("-" * 65)
+    print("-" * 70)
 
-    LABELS_DIR.mkdir(parents=True, exist_ok=True)
+    LABELS_OUT_DIR.mkdir(parents=True, exist_ok=True)
     report = []
-    exported = skipped = single = 0
+    low_agreement = 0
 
-    for img_name in sorted(by_image):
-        anns = by_image[img_name]
-        boxes = [a["box"] for a in anns]
-        classes = [a["class"] for a in anns]
+    for stem in sorted(by_image):
+        entries = by_image[stem]
+        cls_id, merged, mean_iou, weights = consensus_merge(entries)
+        cls_name = CLASS_NAMES.get(cls_id, str(cls_id))
 
-        # Inter-annotator IoU
-        if len(boxes) >= 2:
-            ious = [iou(a, b) for a, b in combinations(boxes, 2)]
-            mean_iou = sum(ious) / len(ious)
-        else:
-            mean_iou = None
-            single += 1
-
-        # Majority class
-        cls_name = max(set(classes), key=classes.count)
-        cls_id = CLASS_IDS.get(cls_name, 0)
-
-        # Merged (average) ground-truth box
-        merged = average_box(boxes)
-
-        # Decide status
-        if mean_iou is not None and mean_iou < min_iou:
-            status = f"low_agreement"
-            skipped += 1
-        else:
-            status = "ok"
+        flagged = mean_iou is not None and mean_iou < min_iou
+        if flagged:
+            low_agreement += 1
 
         iou_str = f"{mean_iou:.3f}" if mean_iou is not None else "solo 1 anotador"
-        flag = "⚠" if status != "ok" else " "
+        flag = "⚠" if flagged else " "
+        weight_str = "  ".join(
+            f"{e['name']}={w:.2f}" for e, w in zip(entries, weights)
+        )
         print(
-            f"{flag} {img_name:<35} "
-            f"n={len(anns)}  acuerdo={iou_str:<8}  cls={cls_name}"
+            f"{flag} {stem:<20} n={len(entries)}"
+            f"  acuerdo={iou_str:<8}  cls={cls_name:<10}  pesos: {weight_str}"
         )
 
-        report.append(
-            {
-                "image": img_name,
-                "annotators": len(anns),
-                "mean_iou": round(mean_iou, 4) if mean_iou is not None else None,
-                "class": cls_name,
-                "merged_box": merged,
-                "status": status,
-            }
-        )
+        cx, cy, w, h = merged
+        out = LABELS_OUT_DIR / f"{stem}.txt"
+        out.write_text(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n", encoding="utf-8")
 
-        if status != "ok":
-            continue
+        report.append({
+            "image": stem,
+            "annotators": [e["name"] for e in entries],
+            "weights": {e["name"]: round(wt, 4) for e, wt in zip(entries, weights)},
+            "mean_iou": round(mean_iou, 4) if mean_iou is not None else None,
+            "class": cls_name,
+            "merged_box": [round(v, 6) for v in merged],
+            "flagged_low_agreement": flagged,
+        })
 
-        # Resolve image path to get dimensions
-        img_path = IMAGES_DIR / img_name
-        if not img_path.exists():
-            found = list(IMAGES_DIR.rglob(img_name))
-            if not found:
-                print(f"  WARN: imagen no encontrada para dimensiones: {img_name}")
-                continue
-            img_path = found[0]
+    REPORT_PATH.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
-        img_w, img_h = Image.open(img_path).size
-        cx, cy, w, h = box_to_yolo(merged, img_w, img_h)
+    print("-" * 70)
+    print(f"Etiquetas exportadas          : {len(by_image)}")
+    print(f"Flaggeadas (IoU < {min_iou:.1f})       : {low_agreement}")
+    print(f"Reporte guardado en           : {REPORT_PATH}")
 
-        label_path = LABELS_DIR / (Path(img_name).stem + ".txt")
-        label_path.write_text(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
-        exported += 1
-
-    # Summary report
-    report_path = PROJECT_ROOT / "test_set" / "agreement_report.json"
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-
-    print("-" * 65)
-    print(f"Etiquetas exportadas    : {exported}")
-    print(f"Omitidas (IoU < {min_iou:.1f})  : {skipped}")
-    print(f"Solo 1 anotador         : {single}")
-    print(f"Reporte guardado en     : {report_path}")
-
-    # Quick agreement summary
     multi = [r for r in report if r["mean_iou"] is not None]
     if multi:
-        avg_agreement = sum(r["mean_iou"] for r in multi) / len(multi)
-        print(f"IoU promedio global     : {avg_agreement:.3f}")
+        avg = sum(r["mean_iou"] for r in multi) / len(multi)
+        print(f"IoU promedio global (N≥2)     : {avg:.3f}")
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Fusiona anotaciones y genera ground truth YOLO para el conjunto de prueba"
+        description="Fusiona anotaciones raw con weighted-consensus merge"
     )
     p.add_argument(
         "--min-iou", type=float, default=0.3,
-        help="IoU mínimo inter-anotador para incluir la imagen (default: 0.3)",
+        help="IoU mínimo para marcar imagen como de bajo acuerdo (default: 0.3). "
+             "No omite la imagen — solo la flaggea en el reporte.",
     )
     return p.parse_args()
 
