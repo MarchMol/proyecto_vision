@@ -1,0 +1,7 @@
+names:
+- bottles
+- tshirts
+nc: 2
+path: C:\Users\MSI\Desktop\info\Escritorio\UVG\9no Semestre\Vision por Computadora\Proyect\proyecto_vision\dataset_aug
+train: images/train
+val: images/val
